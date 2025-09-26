@@ -186,3 +186,123 @@ function boolFrom(name, v, def=false){ if(v==null||v==="") return def; const s=S
 function slugify(s){ return String(s||"").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g,"").replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"")||"untitled"; }
 function prune(o){ if(Array.isArray(o)) return o.map(prune).filter(v=>v!==undefined); if(o&&typeof o==="object"){ const out={}; for(const [k,v] of Object.entries(o)){ const pv=prune(v); if(pv!==undefined&&!Number.isNaN(pv)) out[k]=pv; } return out; } return (o===undefined||Number.isNaN(o))?undefined:o; }
 function mask(s){ return s ? String(s).slice(0,8)+"..." : "MISSING"; }
+
+## Appendix A — `input.config()` Variables (Spec)
+
+This section standardizes the Airtable **Run a script → Input variables** used by Aviary Automations.  
+**Naming:** use `snake_case` keys. **Types:** `string`, `number`, `boolean`.  
+**Validation:** scripts must reject missing/invalid types with actionable errors.
+
+### A.1 Common Inputs (all services)
+
+| Key             | Type    | Required | Example                                         | Notes |
+|-----------------|---------|----------|-------------------------------------------------|-------|
+| `api_endpoint`  | string  | one of   | `https://…/dev/v1/transcribe/jobs`              | Full HTTPS URL **ending in required path** (service-specific). Provide **either** this or `api_base`. |
+| `api_base`      | string  | one of   | `https://…/dev`                                 | HTTPS base; script appends the required path. Provide **either** this or `api_endpoint`. |
+| `webhook_url`   | string  | yes      | `https://hooks.example.com/aviary`              | HTTPS only. Scripts may append helpful query params if `callback_append_params=true`. |
+| `record_id`     | string  | yes      | `recA1B2C3D4`                                   | Used for `idempotency_key` and `correlation_id`. |
+| `podcast_slug`  | string  | yes      | `briefly-remembered`                            | Normalized with `slugify()` unless already clean. |
+| `title_slug`    | string  | yes      | `mel-taub-1954`                                 | Accept as-is if provided; otherwise derive per service rules. |
+| `table_id`      | string  | no       | `tblXyZ…`                                       | If set, script may do an **optional minimal** update (`Status=submitted`, `Job_ID`). |
+
+**Common options**
+
+| Key                       | Type    | Required | Default | Clamp/Validation                    | Notes |
+|---------------------------|---------|----------|---------|-------------------------------------|-------|
+| `callback_append_params`  | boolean | no       | `true`  | –                                   | If true, append `record_id`, `podcast_slug`, `title_slug` to `webhook_url`. |
+
+**Secrets (stored via Automation → Secrets; not `input.config`)**
+
+- `"Condor TTS"`, `"Kestrel Transcription"`, `"Magpie API Key"`  
+- Optional override keys per service (e.g., `condor_secret_name`) may be provided in `input.config` if you support them.
+
+---
+
+### A.2 Service: Condor (TTS)
+
+**Required inputs**
+
+| Key               | Type   | Required | Example                 | Notes |
+|-------------------|--------|----------|-------------------------|-------|
+| `script`          | string | yes      | `Hello <break time="1s"/>` | Text or SSML. Chirp models may trigger client-side SSML → pause mapping. |
+| `tts_provider`    | string | yes      | `google`                | Current standard is `"google"`. Validate values. |
+| `voice_id_google` | string | yes      | `en-US-Neural2-A`       | Sent as `model`/`voice_id`. |
+
+**Optional inputs (options)**
+
+| Key               | Type    | Default | Clamp          |
+|-------------------|---------|---------|----------------|
+| `speed`           | number  | `1.0`   | `[0.25, 4.0]`  |
+| `audio_gain_db`   | number  | `0`     | `[-96, 16]`    |
+| `force_rerender`  | boolean | `false` | –              |
+
+**Endpoint path guard:** `/v1/tts/jobs`
+
+---
+
+### A.3 Service: Kestrel (Transcription)
+
+**Required inputs**
+
+| Key         | Type   | Required | Example                          | Notes |
+|-------------|--------|----------|----------------------------------|-------|
+| `audio_url` | string | yes      | `https://cdn.example.com/x.mp3`  | Public or signed URL; HTTPS. |
+
+**Optional inputs**
+
+| Key       | Type    | Default | Notes                       |
+|-----------|---------|---------|-----------------------------|
+| (none)    |         |         | Request minimal outputs (e.g., `["words"]`) in script. |
+
+**Endpoint path guard:** `/v1/transcribe/jobs`
+
+---
+
+### A.4 Service: Magpie (SFX / Music Gather)
+
+**Required inputs**
+
+| Key              | Type   | Required | Example                       | Notes |
+|------------------|--------|----------|-------------------------------|-------|
+| `cue_sheet_json` | string | yes      | `{"cue_sheet":{…}}` (string)  | JSON **string**; script parses and ensures `episode_id`. |
+
+**Optional inputs (options)**
+
+| Key               | Type    | Default | Clamp           | Notes |
+|-------------------|---------|---------|-----------------|-------|
+| `min_score`       | number  | –       | `[0.0, 1.0]`    | If set. |
+| `max_alternates`  | number  | –       | `[0, 100]`      | Integer. |
+| `force`           | boolean | –       | –               | –       |
+
+**Endpoint path guard:** `/v1/gather`
+
+---
+
+### A.5 Type & Value Rules
+
+- **Strings**: trim; allow lookup/select/linked-field values via lookup-safe coercion (`strFrom()`).
+- **Numbers**: coerce and **clamp**; reject `NaN`.
+- **Booleans**: accept `true/false/1/0/yes/no/y/n/on/off` (case-insensitive).
+- **URLs**: must be `https://`.
+- **Slugs**: normalize with `slugify()` unless user supplied exact `title_slug`.
+
+---
+
+### A.6 Example `input.config()` Sets
+
+**Condor (TTS)**
+```json
+{
+  "api_base": "https://ky6q4irohf.execute-api.us-east-1.amazonaws.com/prod",
+  "webhook_url": "https://hooks.example.com/aviary",
+  "record_id": "recA1B2C3D4",
+  "podcast_slug": "briefly-remembered",
+  "title_slug": "mel-taub-1954",
+  "script": "Hello <break time=\"1s\"/> world",
+  "tts_provider": "google",
+  "voice_id_google": "en-US-Neural2-A",
+  "speed": 1.0,
+  "audio_gain_db": 0,
+  "force_rerender": false,
+  "callback_append_params": true
+}
