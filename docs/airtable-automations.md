@@ -1,114 +1,331 @@
-# Airtable Automations → AWS Lambda Best Practices
+Airtable Automations → Aviary Services (Client) Standards v1.2
 
-KISS and YAGNI: keep Airtable Automations thin. Trigger a fast, asynchronous Lambda/API and handle completion via a webhook that updates Airtable.
+Scope
+Standards for Airtable Automation scripts that submit jobs to Aviary microservices (Condor TTS, Kestrel Transcription, Magpie Gather, Nightingale Mix, etc.) via API Gateway/Lambda.
 
-## Core pattern
-- Trigger: Airtable event (record created/updated) or manual run.
-- Action: "Run a script" → `fetch` POST to your API Gateway endpoint.
-- Response: API responds fast (<3–5s) with `job_id` and status `accepted`.
-- Completion: Your service sends a webhook back (incoming webhook automation) to update the record.
+Goals
+Thin, deterministic clients that: (1) validate inputs, (2) submit a fast async job, (3) correlate via webhooks, (4) expose predictable outputs for downstream steps.
 
-## Authentication
-- Prefer API Gateway with an API key or custom header: `X-API-Key: <key>`.
-- Do NOT store secrets in table fields. Keep them in the Automation script (and restrict editor access) or call a proxy you control that holds the secret.
-- Always use HTTPS. If you sign requests, add `X-Timestamp` and `X-Signature` (HMAC of raw body).
+⸻
 
-## Idempotency and correlation
-- Generate a deterministic idempotency key per record/action, e.g.: `recordId + ":transcribe:v1"`.
-- Include `idempotency_key` and `correlation_id` (the Airtable `recordId`) in the request body.
-- Your backend should use the key to deduplicate requests and return the existing `job_id`.
+1) Core Pattern
+	•	Trigger: Airtable event (record created/updated) or manual run.
+	•	Action: “Run a script” → fetch POST to your API endpoint.
+	•	Response: API returns quickly (<3–5s) { job_id, status: "submitted" | "accepted" }.
+	•	Completion: Your service POSTs a webhook (Airtable incoming webhook automation) that updates the record with final status & artifacts.
+	•	Responsibility split: Automation = submit + (optionally) minimal “submitted” update; webhook = authoritative final update.
 
-## Timeouts and latency
-- Automation scripts should not wait for long jobs. Keep the request quick and non-blocking.
-- Offload work to Step Functions or background Lambda and return immediately with `job_id`.
+⸻
 
-## Retries
-- Implement simple client retries for transient failures (max 2–3 attempts with 1–5s delay).
-- Treat any non-2xx as failure. Do not retry indefinitely. Prefer server-side retries.
+2) Authentication & Secrets
+	•	Always HTTPS.
+	•	Auth header: X-API-Key: <secret> issued by API Gateway usage plan (or your proxy).
+	•	Store secrets with Automation Secrets (input.secret("…")).
+Standard names: "Condor TTS", "Kestrel Transcription", "Magpie API Key".
+Allow an override input (e.g., condor_secret_name) if needed.
+	•	Never store secrets in table fields. Mask secrets in logs (first 6–8 chars only).
+	•	(Optional) Signed requests: add X-Timestamp and X-Signature (HMAC of raw body) if your edge verifies signatures.
 
-## Error handling
-- On failure, set a status field (e.g., "error") on the record and store the `last_error` message and HTTP status.
-- Include the `request_id`/`trace` from response headers if available for debugging.
+⸻
 
-## Observability
-- Save `job_id` to the record after a successful submission.
-- Include `correlation_id` in the request so the webhook can map back to the record.
-- If your API returns an execution ARN or link to logs, store it in a debug field.
+3) Idempotency & Correlation
+	•	Deterministic key: idempotency_key = recordId + ":" + action + ":v1".
+	•	Correlation: include correlation_id = recordId in request and propagate it back in webhooks.
+	•	Backend behavior: identical requests must dedupe and return the existing job_id.
 
-## Webhook (job completion)
-- Use Airtable "When webhook received" trigger for callbacks.
-- Verify signature if provided. Update the record with final status and artifact URLs.
-- If the payload contains a large blob, consider saving only a URL and a compact summary to Airtable fields.
+⸻
 
-## Example: Automation script (POST → async job)
-```javascript
-// Inputs: tableId, recordId, apiBase, apiKey, callbackUrl
-let table = base.getTable(input.config().tableId);
-let recordId = input.config().recordId;
+4) Endpoint Normalization & Path Guards
 
-let idempotencyKey = `${recordId}:transcribe:v1`;
-let body = {
-  correlation_id: recordId,
-  idempotency_key: idempotencyKey,
-  outputs: ["words", "vtt", "srt"],
-  callback_url: input.config().callbackUrl
-};
+Accept either:
+	•	api_endpoint (full URL, must end with required path), or
+	•	api_base (base URL; script appends path).
 
-let resp;
-for (let attempt = 1; attempt <= 3; attempt++) {
+Required path suffixes:
+	•	Condor TTS: /v1/tts/jobs
+	•	Kestrel Transcription: /v1/transcribe/jobs
+	•	Magpie Gather: /v1/gather
+
+Strip trailing /, enforce https, fail fast with helpful hints on mismatches (e.g., “points to TTS; use /v1/transcribe/jobs”).
+
+⸻
+
+5) Inputs, Coercion & Slug Hygiene
+	•	Keep input.config small and typed.
+	•	Use lookup-safe coercers (linked/select fields → strings/numbers/bools) so scripts survive schema changes.
+	•	Normalize slugs with a shared slugify():
+	•	lowercase → NFKD → strip combining marks → [^a-z0-9]+ → - → trim -.
+	•	Accept precise title_slug if supplied; else derive from content or {recordId}-{timestamp}.
+
+Common inputs
+	•	api_endpoint or api_base
+	•	webhook_url (https)
+	•	record_id, podcast_slug, title_slug
+
+Service-specific (examples)
+	•	Condor: script, tts_provider, voice_id_google
+	•	Kestrel: audio_url
+	•	Magpie: cue_sheet_json
+
+Options (examples)
+	•	Numerics (clamped): speed, audio_gain_db, min_score, max_alternates
+	•	Booleans: force, force_rerender, callback_append_params
+
+⸻
+
+6) Timeouts & Retries
+	•	Timeout: wrap fetch with AbortController (target 20s).
+	•	Shallow retry once on transient errors only:
+	•	network errors, timeouts, HTTP >=500, 429 (use 500–1000 ms backoff).
+	•	Do not retry on 4xx (except 408 if you explicitly choose).
+
+⸻
+
+7) Payload Hygiene & Client Fingerprint
+	•	Prune undefined/NaN deeply before POST.
+	•	Clamp numeric options (e.g., speed ∈ [0.25, 4.0], audio_gain_db ∈ [-96, 16]).
+	•	Always include:
+	•	podcast_slug, title_slug
+	•	callback_url (https; may append helpful query params)
+	•	idempotency_key, correlation_id
+	•	client: { tag: "aviary/<service>@<semver>", record_id }
+	•	options tunables
+	•	Service inputs (text, audio_url, cue_sheet, …)
+	•	Headers:
+	•	X-API-Key: <secret>
+	•	X-Client: aviary/<service>@<semver>
+	•	X-Request-Id: <record_id>
+
+Condor/Chirp nicety: If model contains “Chirp” and text includes SSML, map <break> → textual pauses client-side and set options.ssml_mode = "strip".
+
+⸻
+
+8) Error Taxonomy & Hints
+	•	Classify and throw with actionable hints:
+	•	401/403 auth → “Verify API key / usage plan.”
+	•	404 not found → “Check resource path / environment.”
+	•	429 rate → “Back off; server retry policy applies.”
+	•	5xx/502 gateway → “Check Lambda timeout/crash; API Gateway integration; env vars.”
+	•	Log truncated response (~500 chars) and keep raw on outputs for debugging.
+
+⸻
+
+9) Observability & Outputs Contract
+	•	Structured logs: [svc:req], [svc:retry], [svc:err], [svc:ok] with masked headers and truncated payload/response previews.
+	•	Minimum outputs (always set):
+	•	status — "submitted" | "queued" | "ok"
+	•	job_id
+	•	api_url_used
+	•	request_payload_json (stringified, pruned)
+	•	raw_response
+	•	Optional debug:
+	•	http_status_code, response_headers_json, timestamp_iso
+
+It’s fine to do a minimal record update post-submit (e.g., Status=submitted, Job_ID=…); reserve the authoritative write for the webhook.
+
+⸻
+
+10) Webhook (Job Completion)
+	•	Use Airtable incoming webhook trigger.
+	•	Verify signature/timestamp if your service signs callbacks.
+	•	Expect payload:
+	•	job_id, status (succeeded|failed), occurred_at
+	•	correlation_id (Airtable recordId)
+	•	artifacts { primary_url, … }
+	•	Optional blob (stringified JSON for convenience)
+	•	Update record fields: final status, artifact URLs, debug info (request/trace id).
+Prefer storing URLs and concise summaries over large blobs.
+
+⸻
+
+11) Field Design in Airtable
+	•	Status (single select): ready, submitted, processing, succeeded, failed, error
+	•	Job_ID (text)
+	•	Artifacts_URL (URL / multiple)
+	•	Last_Error (long text)
+	•	Updated_At (last modified time)
+	•	Optional: Request_ID/Trace_ID, Service_Logs_URL
+
+⸻
+
+12) Rate Limiting & Triggers
+	•	Don’t trigger on every keystroke. Use stable state changes (e.g., Status = "ready").
+	•	When iterating records, batch and delay between calls to respect service quotas.
+
+⸻
+
+13) Standard Helper Block (copy into each script)
+
+// Lookup-safe & hygiene helpers (keep identical across scripts)
+function maybeUnwrapQuoted(s){ if(s==null) return ""; const str=String(s); const q=str.length>=2&&((str.startsWith('"')&&str.endsWith('"'))||(str.startsWith("'")&&str.endsWith("'"))); return q?str.slice(1,-1):str; }
+function pickFirstStringLike(arr){ if(!Array.isArray(arr)) return null; for(const el of arr){ if(el==null) continue; if(typeof el==="string"){const t=el.trim(); if(t) return t;} if(typeof el==="number"||typeof el==="boolean") return String(el); if(typeof el==="object"){const cand=el.name??el.value??el.id??el.text??null; if(cand&&String(cand).trim()) return String(cand).trim();}} return null; }
+function strFrom(name, v, required=false){ if(Array.isArray(v)){ const first=pickFirstStringLike(v); if(first) return String(first).trim(); if(required) throw new Error(`Missing required input "${name}" (lookup empty).`); return ""; } if(typeof v==="string"||typeof v==="number"||typeof v==="boolean"){ const s=maybeUnwrapQuoted(String(v)).trim(); if(!s&&required) throw new Error(`Missing required input "${name}".`); return s; } if(v&&typeof v==="object"){ const cand=v.name??v.value??v.id??v.text??null; if(cand) return String(cand).trim(); } if(required) throw new Error(`Missing required input "${name}".`); return ""; }
+function numFrom(name, v, def, min=null, max=null){ const raw=Array.isArray(v)?pickFirstStringLike(v):v; const n=Number(maybeUnwrapQuoted(raw)); let out=Number.isFinite(n)?n:def; if(min!=null&&out<min) out=min; if(max!=null&&out>max) out=max; return out; }
+function boolFrom(name, v, def=false){ if(v==null||v==="") return def; const s=String(v).toLowerCase().trim(); if(["true","1","yes","y","on"].includes(s)) return true; if(["false","0","no","n","off"].includes(s)) return false; throw new Error(`Input "${name}" must be boolean-like.`); }
+function slugify(s){ return String(s||"").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g,"").replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"")||"untitled"; }
+function prune(o){ if(Array.isArray(o)) return o.map(prune).filter(v=>v!==undefined); if(o&&typeof o==="object"){ const out={}; for(const [k,v] of Object.entries(o)){ const pv=prune(v); if(pv!==undefined&&!Number.isNaN(pv)) out[k]=pv; } return out; } return (o===undefined||Number.isNaN(o))?undefined:o; }
+function mask(s){ return s ? String(s).slice(0,8)+"..." : "MISSING"; }
+
+
+⸻
+
+14) Example: Submit Transcription Job (Kestrel-style)
+
+/**
+ * Airtable Automation → Kestrel Transcription: Submit Job
+ * Version: v1.2
+ * Responsibility: submit & exit; webhook performs final record update.
+ */
+
+// ---- constants ----
+const REQUIRED_PATH = "/v1/transcribe/jobs";
+const CLIENT_TAG = "aviary/kestrel@1.2.0";
+const TIMEOUT_MS = 20000;
+
+// ---- helpers (paste standard block above): maybeUnwrapQuoted, pickFirstStringLike, strFrom, numFrom, boolFrom, slugify, prune, mask ----
+
+// endpoint guard
+function normalizeEndpoint(api_endpoint, api_base, requiredPath){
+  const ep = strFrom("api_endpoint", api_endpoint, false);
+  if (ep){
+    const u = new URL(ep);
+    if (u.protocol !== "https:") throw new Error("api_endpoint must be https");
+    const trimmed = ep.replace(/\/+$/,"");
+    if (!trimmed.endsWith(requiredPath)) throw new Error(`api_endpoint must end with ${requiredPath} (got ${trimmed})`);
+    return trimmed;
+  }
+  const base = strFrom("api_base", api_base, true);
+  const u = new URL(base);
+  if (u.protocol !== "https:") throw new Error("api_base must be https");
+  return base.replace(/\/+$/,"") + requiredPath;
+}
+
+async function postWithTimeout(url, headers, body, timeoutMs){
+  const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const t = setTimeout(()=>ctrl && ctrl.abort(), timeoutMs);
   try {
-    resp = await fetch(`${input.config().apiBase}/v1/transcribe/jobs`, {
+    const res = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-API-Key": input.config().apiKey
-      },
-      body: JSON.stringify(body)
+      headers,
+      body: JSON.stringify(body),
+      ...(ctrl ? { signal: ctrl.signal } : {})
     });
-    if (resp.status >= 200 && resp.status < 300) break;
-    await delay(1000 * attempt);
-  } catch (e) {
-    if (attempt === 3) throw e;
-    await delay(1000 * attempt);
+    const text = await res.text();
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} :: ${text.slice(0,500)}`);
+    let json = null; try { json = JSON.parse(text); } catch {}
+    return { res, text, json };
+  } finally {
+    clearTimeout(t);
   }
 }
 
-if (!resp || resp.status < 200 || resp.status >= 300) {
-  const msg = resp ? await resp.text() : "no response";
-  await table.updateRecordAsync(recordId, {
-    Status: "error",
-    Last_Error: msg.slice(0, 500)
+try {
+  const cfg = input.config();
+
+  // Inputs
+  const apiUrl   = normalizeEndpoint(cfg.api_endpoint, cfg.api_base, REQUIRED_PATH);
+  const recordId = strFrom("record_id", cfg.record_id, true);
+  const podcast  = slugify(strFrom("podcast_slug", cfg.podcast_slug, true));
+  const title    = slugify(strFrom("title_slug",   cfg.title_slug,   true));
+  const webhook  = strFrom("webhook_url", cfg.webhook_url, true);
+  if (!/^https:\/\//i.test(webhook)) throw new Error("webhook_url must be https");
+  const audioUrl = strFrom("audio_url", cfg.audio_url, true);
+
+  // Secret
+  const apiKey = input.secret("Kestrel Transcription");
+  if (!apiKey) throw new Error('Missing secret "Kestrel Transcription" (Automation → Secrets).');
+
+  // Payload (pruned)
+  const idempotencyKey = `${recordId}:transcribe:v1`;
+  let payload = prune({
+    correlation_id: recordId,
+    idempotency_key: idempotencyKey,
+    callback_url: webhook,
+    podcast_slug: podcast,
+    title_slug: title,
+    audio: { audio_url: audioUrl },
+    outputs: ["words"] // request only what you need
   });
-  output.markdown(`Failed: ${msg}`);
-  return;
+
+  // Masked request preview
+  console.log("[kestrel:req]", {
+    url: apiUrl,
+    headers: { "X-API-Key": mask(apiKey), "X-Client": CLIENT_TAG, "X-Request-Id": recordId },
+    preview: JSON.stringify(payload).slice(0,200) + "…"
+  });
+
+  // POST + shallow retry once on transient
+  let attempt = 0, result, lastErr;
+  while (attempt < 2) {
+    attempt++;
+    try {
+      result = await postWithTimeout(
+        apiUrl,
+        { "Content-Type": "application/json", "X-API-Key": apiKey, "X-Client": CLIENT_TAG, "X-Request-Id": recordId },
+        payload,
+        TIMEOUT_MS
+      );
+      break;
+    } catch (e) {
+      const m = String(e.message).match(/HTTP\s+(\d{3})/);
+      const status = m ? Number(m[1]) : 0;
+      if (attempt < 2 && (status >= 500 || status === 429 || /aborted|timeout|network/i.test(e.message))) {
+        console.log("[kestrel:retry]", { attempt });
+        await new Promise(r => setTimeout(r, 800));
+        continue;
+      }
+      lastErr = e; break;
+    }
+  }
+  if (!result) throw lastErr || new Error("Unknown submission failure");
+
+  const { res, text, json } = result;
+  const jobId = json?.job_id;
+  if (!jobId) throw new Error(`Unexpected response (missing job_id): ${text.slice(0,500)}`);
+
+  // Outputs
+  output.set("status", json?.status || "submitted");
+  output.set("job_id", jobId);
+  output.set("api_url_used", apiUrl);
+  output.set("request_payload_json", JSON.stringify(payload));
+  output.set("raw_response", text);
+  output.set("http_status_code", res.status);
+  output.set("timestamp_iso", new Date().toISOString());
+
+  // Optional minimal record update (safe)
+  const tableId = strFrom("table_id", cfg.table_id, false);
+  if (tableId) {
+    const table = base.getTable(tableId);
+    await table.updateRecordAsync(recordId, { "Job_ID": jobId, "Status": "submitted" });
+  }
+
+  console.log("[kestrel:ok]", { jobId, status: json?.status || "submitted" });
+
+} catch (err) {
+  console.error("[kestrel:err]", { message: err.message?.slice(0,500) });
+  output.set("status", "error");
+  output.set("raw_response", String(err.message || err));
+  throw err;
 }
 
-const data = await resp.json();
-await table.updateRecordAsync(recordId, {
-  Job_ID: data.job_id,
-  Status: "submitted"
-});
 
-function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
-```
+⸻
 
-## Example: Webhook payload expectations
-- Your service should send back at completion:
-  - `job_id`, `status`, `occurred_at`
-  - `correlation_id` (Airtable `recordId`)
-  - `artifacts` with public URLs (e.g., CloudFront)
-  - Optionally an inline `blob` (stringified JSON) for convenience
+15) Webhook Payload Expectations (Server → Airtable)
+	•	Required: job_id, status (succeeded | failed), occurred_at, correlation_id
+	•	Artifacts: { primary_url, … } (prefer public/perm URLs, e.g., CloudFront/S3 pre-signed as needed)
+	•	Optional: blob (compact JSON with relevant debug/metrics), request_id/trace_id
 
-## Field design in Airtable
-- Add fields: `Status` (single select), `Job_ID` (text), `Last_Error` (long text), `Artifacts_URL` (URL), `Updated_At` (last modified time).
-- Keep only necessary data in Airtable; store large payloads externally and link by URL.
+⸻
 
-## Security notes
-- Do not embed secrets in base tables. If Automations lack secure secrets for your case, route via a minimal proxy that injects credentials server-side.
-- Validate webhook signatures and timestamps; reject if stale.
+16) Security Notes
+	•	HTTPS everywhere. Validate webhook signatures/timestamps; reject if stale.
+	•	Consider allowlisting callback_url hostnames.
+	•	Keep secrets out of output.set and table fields. Mask secrets in logs.
 
-## Rate limiting
-- Throttle submissions using batch triggers and the Automation "delay" between operations when iterating records.
-- Avoid firing on every keystroke; trigger on stable state changes (e.g., when `Status` becomes "ready").
+⸻
 
-
+17) Change Log
+	•	v1.2 — Added endpoint suffix guards, shallow retry, timeout, masked logging, fixed outputs, helper block, normalized slugs, idempotency convention.
+	•	v1.1 — Clarified webhook payloads & field design.
+	•	v1.0 — Initial standards.
