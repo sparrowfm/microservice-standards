@@ -69,18 +69,18 @@ Accept either:
 - `api_endpoint` (full URL, **must** end with required path), or
 - `api_base` (base URL; script appends path).
 
-**Required path suffixes:**
+**Service-specific path suffixes:**
 
-- Condor TTS: `/v1/tts/jobs`
-- Kestrel Transcription: `/v1/transcribe/jobs`
-- Magpie Gather: `/v1/gather`
-- Starling RSS: `/feeds` (for feed creation) or `/feeds/{feed_id}/items/upsert` (for episodes)
+Each service defines its required path. Examples:
+- TTS services: `/v1/tts/jobs`
+- Transcription services: `/v1/transcribe/jobs`
+- RSS services: `/feeds` or `/feeds/{resource_id}/items`
 
 Also:
 
 - Strip trailing `/`.
 - Enforce **https**.
-- Fail fast with helpful hints on mismatches (e.g., "points to TTS; use `/v1/transcribe/jobs`").
+- Fail fast with helpful hints on mismatches.
 
 ### 4.1) Endpoint Construction Pattern
 
@@ -89,8 +89,8 @@ Also:
 **Good:**
 ```javascript
 const apiBase = strFrom("api_base", cfg.api_base, true);
-const feedId = strFrom("feed_id", cfg.feed_id, true);
-const apiEndpoint = `${apiBase}/feeds/${feedId}/items/upsert`;
+const resourceId = strFrom("resource_id", cfg.resource_id, true);
+const apiEndpoint = `${apiBase}/resource/${resourceId}/action`;
 ```
 
 **Avoid:**
