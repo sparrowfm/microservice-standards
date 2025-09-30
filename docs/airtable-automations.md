@@ -1,4 +1,4 @@
-# Airtable Automations → Aviary Services (Client) Standards v1.2
+# Airtable Automations → Aviary Services (Client) Standards v1.3
 
 **Scope**  
 Standards for Airtable **Automation** scripts that submit jobs to Aviary microservices (Condor TTS, Kestrel Transcription, Magpie Gather, Nightingale Mix, etc.) via API Gateway/Lambda.
@@ -32,9 +32,33 @@ Thin, deterministic clients that: (1) validate inputs, (2) submit a fast async j
 
 ## 3) Idempotency & Correlation
 
-- **Deterministic key:** `idempotency_key = recordId + ":" + action + ":v1"`.  
-- **Correlation:** include `correlation_id = recordId` in request **and** propagate it back in webhooks.  
+- **Deterministic key:** `idempotency_key = recordId + ":" + action + ":v1"`.
+- **Correlation:** include `correlation_id = recordId` in request **and** propagate it back in webhooks.
 - **Backend behavior:** identical requests must dedupe and return the **existing** `job_id`.
+
+### 3.1) Job ID Format Convention
+
+Use **semantic, human-readable job IDs** in the format: `job_{resource_id}_{timestamp}`
+
+**Benefits:**
+- Easier debugging in logs and monitoring
+- Natural correlation across API responses and webhooks
+- Self-documenting (contains context about what resource is being processed)
+
+**Example:**
+```javascript
+const jobId = `job_${feedId}_${Date.now()}`;
+```
+
+**Important:** The **client should NOT generate the job_id**. The backend Lambda should:
+1. Generate the semantic job_id when the job is accepted
+2. Return it in the API response
+3. Include it in the SQS message
+4. Pass it through to the webhook callback
+
+This ensures the same job_id appears consistently across:
+- Initial API response: `{ job_id: "job_feed-123_1759255913454" }`
+- Webhook callback: `{ job_id: "job_feed-123_1759255913454", artifacts: { job_id: "..." } }`
 
 ---
 
@@ -42,20 +66,41 @@ Thin, deterministic clients that: (1) validate inputs, (2) submit a fast async j
 
 Accept either:
 
-- `api_endpoint` (full URL, **must** end with required path), or  
+- `api_endpoint` (full URL, **must** end with required path), or
 - `api_base` (base URL; script appends path).
 
 **Required path suffixes:**
 
-- Condor TTS: `/v1/tts/jobs`  
-- Kestrel Transcription: `/v1/transcribe/jobs`  
+- Condor TTS: `/v1/tts/jobs`
+- Kestrel Transcription: `/v1/transcribe/jobs`
 - Magpie Gather: `/v1/gather`
+- Starling RSS: `/feeds` (for feed creation) or `/feeds/{feed_id}/items/upsert` (for episodes)
 
 Also:
 
-- Strip trailing `/`.  
-- Enforce **https**.  
-- Fail fast with helpful hints on mismatches (e.g., “points to TTS; use `/v1/transcribe/jobs`”).
+- Strip trailing `/`.
+- Enforce **https**.
+- Fail fast with helpful hints on mismatches (e.g., "points to TTS; use `/v1/transcribe/jobs`").
+
+### 4.1) Endpoint Construction Pattern
+
+**Pattern:** Accept `api_base` and construct the full endpoint path in the script.
+
+**Good:**
+```javascript
+const apiBase = strFrom("api_base", cfg.api_base, true);
+const feedId = strFrom("feed_id", cfg.feed_id, true);
+const apiEndpoint = `${apiBase}/feeds/${feedId}/items/upsert`;
+```
+
+**Avoid:**
+- Asking for full endpoint paths with path parameters filled in
+- Requiring users to construct URLs manually in Airtable
+
+**Rationale:**
+- Users only need to configure the base URL once
+- Script handles path parameters automatically
+- Less error-prone configuration
 
 ---
 
@@ -118,41 +163,118 @@ Also:
 ## 8) Error Taxonomy & Hints
 
 - Classify and throw with actionable hints:
-  - `401/403` auth → “Verify API key / usage plan.”
-  - `404` not found → “Check resource path / environment.”
-  - `429` rate → “Back off; server retry policy applies.”
-  - `5xx/502` gateway → “Check Lambda timeout/crash; API Gateway integration; env vars.”
+  - `401/403` auth → "Verify API key / usage plan."
+  - `404` not found → "Check resource path / environment."
+  - `422` validation → "Check required fields are present and valid."
+  - `429` rate → "Back off; server retry policy applies."
+  - `5xx/502` gateway → "Check Lambda timeout/crash; API Gateway integration; env vars."
 - **Log** truncated response (~500 chars) and keep raw on outputs for debugging.
+
+### 8.1) Error Hint Pattern
+
+Provide contextual, actionable hints for common HTTP error codes:
+
+```javascript
+if (status >= 400 && status < 500) {
+  let hint = "";
+  if (status === 401 || status === 403) {
+    hint = "\nHint: Verify API key is correct and has permissions.";
+  } else if (status === 404) {
+    hint = "\nHint: Check resource exists. May need to create it first.";
+  } else if (status === 422) {
+    hint = "\nHint: Check required fields are present and valid.";
+  } else if (status === 429) {
+    hint = "\nHint: Rate limited. Back off and retry later.";
+  }
+
+  throw new Error(`HTTP ${status}: ${responseText.slice(0, 500)}${hint}`);
+}
+```
 
 ---
 
 ## 9) Observability & Outputs Contract
 
-- **Structured logs:** `[svc:req]`, `[svc:retry]`, `[svc:err]`, `[svc:ok]` with masked headers and truncated payload/response previews.  
+- **Structured logs:** `[svc:req]`, `[svc:retry]`, `[svc:err]`, `[svc:ok]` with masked headers and truncated payload/response previews.
 - **Minimum outputs** (always set):
   - `status` — `"submitted" | "queued" | "ok"`
-  - `job_id`
+  - `job_id` — Semantic job ID in format `job_{resource_id}_{timestamp}` (use for correlation with webhook)
   - `api_url_used`
   - `request_payload_json` (stringified, pruned)
   - `raw_response`
 - **Optional debug:**
   - `http_status_code`, `response_headers_json`, `timestamp_iso`
 
-> It’s fine to do a **minimal** record update post-submit (e.g., `Status=submitted`, `Job_ID=…`); reserve the authoritative write for the webhook.
+### 9.1) Optional Immediate Status Updates
+
+Scripts may optionally update the record immediately after job submission:
+
+```javascript
+if (tableId) {
+  try {
+    const table = base.getTable(tableId);
+    await table.updateRecordAsync(recordId, {
+      "Status": "submitted",
+      "Job ID": jobId,
+    });
+  } catch (updateErr) {
+    console.warn(`[${SERVICE}:warn] Could not update record: ${updateErr.message}`);
+  }
+}
+```
+
+**Important:**
+- Make this optional via `table_id` parameter
+- Catch and warn on failure (don't fail the entire job)
+- The webhook callback provides the authoritative final update
+- Only update minimal fields (status, job_id)
 
 ---
 
 ## 10) Webhook (Job Completion)
 
-- Use Airtable **incoming webhook** trigger.  
-- Verify signature/timestamp if your service signs callbacks.  
+- Use Airtable **incoming webhook** trigger.
+- Verify signature/timestamp if your service signs callbacks.
 - Expect payload:
   - `job_id`, `status` (`succeeded|failed`), `occurred_at`
   - `correlation_id` (Airtable `recordId`)
   - `artifacts` object (e.g., `{ "primary_url": "https://…" }`)
   - Optional `blob` (stringified JSON for convenience)
-- Update record fields: final status, artifact URLs, debug info (request/trace id).  
+- Update record fields: final status, artifact URLs, debug info (request/trace id).
   Prefer storing **URLs** and concise summaries over large blobs.
+
+### 10.1) Standard Webhook Payload
+
+All webhooks should follow this structure:
+
+```json
+{
+  "event_type": "item.published",
+  "version": "v1",
+  "job_id": "job_{resource}_{timestamp}",
+  "event_id": "uuid",
+  "subject_id": "resource-id",
+  "status": "success" | "error",
+  "source": "service-name",
+  "times": {
+    "published_at": "ISO8601",
+    "processed_at": "ISO8601"
+  },
+  "attempt": 1,
+  "correlation_id": "airtable-record-id",
+  "artifacts": {
+    "job_id": "job_{resource}_{timestamp}"
+  },
+  "blob": {}
+}
+```
+
+**Key points:**
+- `job_id` appears at top level AND in artifacts for easy access
+- `correlation_id` maps to the Airtable record ID for updates
+- `subject_id` identifies the primary resource (feed_id, item_id, etc.)
+- `artifacts` contains service-specific outputs (URLs, ETags, etc.)
+- Same `job_id` format as returned in initial API response for correlation
 
 ---
 
