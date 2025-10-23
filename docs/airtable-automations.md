@@ -3,8 +3,24 @@
 **Scope**  
 Standards for Airtable **Automation** scripts that submit jobs to Aviary microservices (Condor TTS, Kestrel Transcription, Magpie Gather, Nightingale Mix, etc.) via API Gateway/Lambda.
 
-**Goals**  
+**Goals**
 Thin, deterministic clients that: (1) validate inputs, (2) submit a fast async job, (3) correlate via webhooks, (4) expose predictable outputs for downstream steps.
+
+---
+
+## ⚠️ Critical: Airtable Scripting Limitations
+
+**Airtable's scripting environment does NOT support:**
+- `setTimeout` / `setInterval` - **Will throw "setTimeout is not defined" errors**
+- `AbortController` - Cannot implement client-side request timeouts
+- Most Node.js built-in modules
+
+**What this means for your scripts:**
+- ❌ Cannot add delays between retries (retry immediately instead)
+- ❌ Cannot implement fetch timeouts with AbortController (rely on Airtable's built-in timeout)
+- ✅ Can use `fetch`, `Promise`, `async/await`, standard JavaScript
+
+**⚠️ AI coding tools (Claude, GPT, Copilot) frequently generate setTimeout/AbortController - always remove them!**
 
 ---
 
@@ -133,9 +149,10 @@ const apiEndpoint = `${apiBase}/resource/${resourceId}/action`;
 
 ## 6) Timeouts & Retries
 
-- **Timeout:** wrap `fetch` with `AbortController` (target **20s**).  
+- **Timeout:** ~~wrap `fetch` with `AbortController`~~ **NOT SUPPORTED** - Rely on Airtable's built-in script timeout instead.
 - **Shallow retry once** on transient errors only:
-  - network errors, timeouts, HTTP `>=500`, `429` (use 500–1000 ms backoff).
+  - network errors, timeouts, HTTP `>=500`, `429`
+  - **Important:** Retry immediately (no backoff delay) - `setTimeout` is not supported in Airtable
 - **Do not retry** on `4xx` (except `408` if you explicitly choose).
 
 ---
@@ -291,8 +308,63 @@ All webhooks should follow this structure:
 
 ## 12) Rate Limiting & Triggers
 
-- Don’t trigger on every keystroke. Use stable state changes (e.g., `Status = "ready"`).  
+- Don't trigger on every keystroke. Use stable state changes (e.g., `Status = "ready"`).
 - When iterating records, **batch** and **delay** between calls to respect service quotas.
+
+---
+
+## 12.1) Common AI Coding Tool Mistakes
+
+**AI assistants (Claude, GPT, Copilot) frequently generate Airtable code with unsupported features.**
+
+### ❌ setTimeout() - Will Fail
+```javascript
+// WRONG - AI tools often generate this:
+await new Promise(resolve => setTimeout(resolve, 1000));
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+```
+
+**Error:** `setTimeout is not defined`
+
+### ❌ AbortController - Not Supported
+```javascript
+// WRONG - AI tools often generate this:
+const controller = new AbortController();
+const timeout = setTimeout(() => controller.abort(), 5000);
+const response = await fetch(url, { signal: controller.signal });
+```
+
+**Error:** `setTimeout is not defined` + `AbortController` may not work reliably
+
+### ✅ What to Do Instead
+
+**Retries:** Retry immediately without delay
+```javascript
+// CORRECT:
+for (let attempt = 1; attempt <= 3; attempt++) {
+  try {
+    const response = await fetch(url, options);
+    if (response.ok) break;
+    // Retry immediately - no delay possible
+  } catch (e) {
+    if (attempt === 3) throw e;
+    // Retry immediately on network errors
+  }
+}
+```
+
+**Timeouts:** Rely on Airtable's built-in script timeout
+```javascript
+// CORRECT - just use fetch without timeout wrapper:
+const response = await fetch(url, options);
+// Airtable will automatically timeout the entire script if it runs too long
+```
+
+### When Prompting AI Coding Tools
+
+Always include these constraints:
+
+> "This is for Airtable Automations. Do NOT use setTimeout, setInterval, or AbortController. These are not supported and will cause runtime errors. Implement immediate retries without delays. Do not wrap fetch with timeout logic."
 
 ---
 
