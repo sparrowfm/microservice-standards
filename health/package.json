@@ -1,0 +1,28 @@
+{
+  "name": "@aviary/health",
+  "version": "1.0.0",
+  "description": "Shared health check handler for Aviary microservices",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "lint": "eslint src/**/*.ts"
+  },
+  "keywords": ["aviary", "health", "lambda"],
+  "author": "Aviary Platform",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/client-sqs": "^3.600.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.119",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "@types/aws-lambda": "^8.10.119"
+  }
+}
